@@ -269,3 +269,98 @@ describe('webhook dispatch', () => {
     vi.unstubAllGlobals()
   })
 })
+
+describe('sentry webhook delivery', () => {
+  const sentryUrl =
+    'https://sentry.io/api/0/organizations/acme/flags/hooks/provider/generic/hook-abc123/'
+
+  function captureSentry() {
+    const received: { body: unknown; headers: Record<string, string> }[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes('sentry.io')) {
+          received.push({
+            body: JSON.parse(init?.body as string),
+            headers: Object.fromEntries(
+              Object.entries(init?.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v as string]),
+            ),
+          })
+        }
+        return new Response('OK', { status: 200 })
+      }),
+    )
+    return received
+  }
+
+  async function createSentryWebhook(app: ReturnType<typeof makeServer>) {
+    const res = await app.request('/api/v1/webhooks', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ url: sentryUrl }),
+    })
+    return (await res.json()) as { id: string; secret: string }
+  }
+
+  it('delivers a flag change in the Sentry envelope', async () => {
+    const app = makeServer()
+    const received = captureSentry()
+    await createSentryWebhook(app)
+
+    await app.request('/api/v1/flags/my-flag', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify({ enabled: true, rollout: { percentage: 100 } }),
+    })
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(1)
+    const body = received[0]!.body as {
+      meta: { version: number }
+      data: { action: string; flag: string; change_id: number }[]
+    }
+    expect(body.meta).toEqual({ version: 1 })
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]).toMatchObject({ action: 'created', flag: 'my-flag' })
+    expect(Number.isSafeInteger(body.data[0]!.change_id)).toBe(true)
+    expect(received[0]!.headers['x-sentry-signature']).toMatch(/^[0-9a-f]{64}$/)
+    expect(received[0]!.headers['x-flaghoist-event']).toBeUndefined()
+
+    vi.unstubAllGlobals()
+  })
+
+  it('reports a successful test delivery to a Sentry endpoint', async () => {
+    const app = makeServer()
+    captureSentry()
+    const hook = await createSentryWebhook(app)
+
+    const res = await app.request(`/api/v1/webhooks/${hook.id}/test`, {
+      method: 'POST',
+      headers: adminHeaders,
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ status: 200, ok: true })
+
+    vi.unstubAllGlobals()
+  })
+
+  it('reports a failed test delivery without throwing', async () => {
+    const app = makeServer()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('boom', { status: 500 })),
+    )
+    const hook = await createSentryWebhook(app)
+
+    const res = await app.request(`/api/v1/webhooks/${hook.id}/test`, {
+      method: 'POST',
+      headers: adminHeaders,
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ status: 500, ok: false })
+
+    vi.unstubAllGlobals()
+  })
+})

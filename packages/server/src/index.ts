@@ -73,7 +73,7 @@ import {
   dispatchWebhooks,
   generateId,
   generateSecret,
-  sign as signWebhook,
+  dispatchWebhook,
   validateWebhookInput,
   type MemberWebhookPayload,
   type WebhookPayload,
@@ -999,19 +999,7 @@ export function createFlagServer<Env extends object = Record<string, unknown>>(
         actor: identity,
       }
       try {
-        const body = JSON.stringify(payload)
-        const signature = await signWebhook(hook.secret, body)
-        const res = await fetch(hook.url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Flaghoist-Event': 'flag.updated',
-            'X-Flaghoist-Signature': signature,
-            'X-Flaghoist-Webhook-Id': hook.id,
-          },
-          body,
-          signal: AbortSignal.timeout(10_000),
-        })
+        const res = await dispatchWebhook(hook, payload.event, payload)
         return c.json({ status: res.status, ok: res.ok })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Request failed'

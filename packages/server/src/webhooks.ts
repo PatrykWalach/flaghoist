@@ -123,7 +123,15 @@ export async function sign(secret: string, body: string): Promise<string> {
   )
   const sig = await crypto.subtle.sign('HMAC', key, enc.encode(body))
   const hex = [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')
-  return `sha256=${hex}`
+  return hex
+}
+
+async function generateChangeId(change: string) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(change))
+
+  const bytes = new DataView(hash)
+  // Keep 53 bits so the result is an exact JavaScript integer.
+  return Number(bytes.getBigUint64(0, false) & 0x1fffffffffffffn)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +172,22 @@ export interface MemberWebhookPayload {
 
 export type WebhookPayload = FlagWebhookPayload | MemberWebhookPayload
 
+export interface WebhookPayloadSentryData {
+  change_id: number //	A 64-bit idempotency token representing a unique change group.
+  action: 'created' | 'updated' | 'deleted'
+  created_at: string // e.g. "2024-12-12T00:02:00+00:00";
+  created_by: {
+    id: string // e.g. "first.last@company.com";
+    type: 'email' | 'id' | 'name'
+  }
+  flag: string // e.g. "hello.world";
+}
+
+export interface WebhookPayloadSentry {
+  data: [WebhookPayloadSentryData]
+  meta: { version: 1 }
+}
+
 export async function dispatchWebhooks(
   store: WebhookStore,
   event: WebhookEvent,
@@ -173,28 +197,108 @@ export async function dispatchWebhooks(
   const active = hooks.filter((h) => h.enabled && h.events.includes(event))
   if (active.length === 0) return
 
-  const body = JSON.stringify(payload)
-
   const deliveries = active.map(async (hook) => {
     try {
-      const signature = await sign(hook.secret, body)
-      await fetch(hook.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Flaghoist-Event': event,
-          'X-Flaghoist-Signature': signature,
-          'X-Flaghoist-Webhook-Id': hook.id,
-        },
-        body,
-        signal: AbortSignal.timeout(10_000),
-      })
+      await dispatchWebhook(hook, event, payload)
     } catch {
       // fire-and-forget: log failures but do not block the caller
     }
   })
 
   await Promise.allSettled(deliveries)
+}
+
+export async function dispatchWebhook(
+  hook: WebhookEndpoint,
+  event: WebhookEvent,
+  payload: WebhookPayload,
+): Promise<Response> {
+  const format = /\/organizations\/.+\/flags\/hooks\/provider\/generic\/$/.test(hook.url)
+    ? 'sentry'
+    : 'flaghoist'
+
+  switch (format) {
+    case 'sentry': {
+      switch (payload.event) {
+        case 'member.removed':
+        case 'member.joined':
+        case 'member.disabled':
+        case 'member.enabled':
+        case 'member.invited':
+        case 'member.role_changed': {
+          throw new Error(
+            'When setting up the hook for ' +
+              hook.url +
+              ' event type of ' +
+              payload.event +
+              " was selected but it's not supported by Sentry",
+          )
+        }
+
+        case 'flag.deleted':
+        case 'flag.restored':
+        case 'flag.updated':
+        case 'flag.created':
+        case 'flag.archived': {
+          const eventData = {
+            action: (
+              {
+                'flag.deleted': 'deleted',
+                'flag.restored': 'created',
+                'flag.updated': 'updated',
+                'flag.created': 'created',
+                'flag.archived': 'deleted',
+              } as const
+            )[payload.event],
+            created_at: payload.timestamp,
+            created_by: {
+              type: 'name',
+              id: payload.actor,
+            },
+            flag: payload.flag.key,
+          } satisfies Omit<WebhookPayloadSentryData, 'change_id'>
+          const payloadSentry: WebhookPayloadSentry = {
+            meta: { version: 1 },
+            data: [
+              {
+                change_id: await generateChangeId(JSON.stringify(eventData)),
+                ...eventData,
+              },
+            ],
+          }
+
+          const body = JSON.stringify(payloadSentry)
+
+          const signature = await sign(hook.secret, body)
+          return await fetch(hook.url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Sentry-Signature': signature,
+            },
+            body,
+            signal: AbortSignal.timeout(10_000),
+          })
+        }
+      }
+    }
+    case 'flaghoist': {
+      const body = JSON.stringify(payload)
+
+      const signature = await sign(hook.secret, body)
+      return await fetch(hook.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Flaghoist-Event': event,
+          'X-Flaghoist-Signature': `sha256=${signature}`,
+          'X-Flaghoist-Webhook-Id': hook.id,
+        },
+        body,
+        signal: AbortSignal.timeout(10_000),
+      })
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
