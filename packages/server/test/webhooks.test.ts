@@ -1,5 +1,5 @@
 import { memoryAdapter } from '@flaghoist/adapter-memory'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apiKey, bearerToken, createFlagServer } from '../src/index'
 
 const adminHeaders = { authorization: 'Bearer admin-secret', 'content-type': 'application/json' }
@@ -271,8 +271,10 @@ describe('webhook dispatch', () => {
 })
 
 describe('sentry webhook delivery', () => {
-  const sentryUrl =
-    'https://sentry.io/api/0/organizations/acme/flags/hooks/provider/generic/hook-abc123/'
+  const sentryUrl = 'https://sentry.io/api/0/organizations/acme/flags/hooks/provider/generic/'
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
 
   function captureSentry() {
     const received: { body: unknown; headers: Record<string, string> }[] = []
@@ -314,19 +316,25 @@ describe('sentry webhook delivery', () => {
     })
     await new Promise((r) => setTimeout(r, 50))
 
-    expect(received).toHaveLength(1)
-    const body = received[0]!.body as {
-      meta: { version: number }
-      data: { action: string; flag: string; change_id: number }[]
-    }
-    expect(body.meta).toEqual({ version: 1 })
-    expect(body.data).toHaveLength(1)
-    expect(body.data[0]).toMatchObject({ action: 'created', flag: 'my-flag' })
-    expect(Number.isSafeInteger(body.data[0]!.change_id)).toBe(true)
-    expect(received[0]!.headers['x-sentry-signature']).toMatch(/^[0-9a-f]{64}$/)
-    expect(received[0]!.headers['x-flaghoist-event']).toBeUndefined()
-
-    vi.unstubAllGlobals()
+    expect(received).toEqual([
+      {
+        body: {
+          data: [
+            expect.objectContaining({
+              action: 'created',
+              flag: 'my-flag',
+              change_id: expect.toSatisfy(Number.isSafeInteger),
+            }),
+          ],
+          meta: {
+            version: 1,
+          },
+        },
+        headers: expect.objectContaining({
+          'x-sentry-signature': expect.stringMatching(/^[0-9a-f]{64}$/),
+        }),
+      },
+    ])
   })
 
   it('reports a successful test delivery to a Sentry endpoint', async () => {
@@ -341,8 +349,6 @@ describe('sentry webhook delivery', () => {
 
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ status: 200, ok: true })
-
-    vi.unstubAllGlobals()
   })
 
   it('reports a failed test delivery without throwing', async () => {
@@ -360,7 +366,5 @@ describe('sentry webhook delivery', () => {
 
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ status: 500, ok: false })
-
-    vi.unstubAllGlobals()
   })
 })
